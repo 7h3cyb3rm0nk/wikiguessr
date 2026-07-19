@@ -1,5 +1,6 @@
 import { useState } from "react";
 import homeBg from "../assets/home-bg.png";
+import "../styles/Home.css";
 
 function Home() {
   const [showJoin, setShowJoin] = useState(false);
