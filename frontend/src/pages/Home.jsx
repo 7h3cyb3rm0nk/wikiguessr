@@ -22,6 +22,12 @@ function Home() {
 
       {!showJoin && (
         <button className="primary-btn">
+           ▶ Play
+        </button>
+      )}
+      
+      {!showJoin && (
+        <button className="primary-btn">
           Create Room
         </button>
       )}
