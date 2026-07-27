@@ -84,3 +84,28 @@ impl From<serde_json::Error> for AppError {
         AppError::BadRequest(err.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_error_into_response_status_codes() {
+        assert_eq!(AppError::NotFound("x".into()).into_response().status(), StatusCode::NOT_FOUND);
+        assert_eq!(AppError::BadRequest("x".into()).into_response().status(), StatusCode::BAD_REQUEST);
+        assert_eq!(AppError::AlreadyExists("x".into()).into_response().status(), StatusCode::CONFLICT);
+        assert_eq!(AppError::Unauthorized("x".into()).into_response().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(AppError::Internal("x".into()).into_response().status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(AppError::WikimediaFetch("x".into()).into_response().status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn app_error_display_formatting() {
+        assert_eq!(format!("{}", AppError::NotFound("foo".into())), "Not found: foo");
+        assert_eq!(format!("{}", AppError::BadRequest("bar".into())), "Bad request: bar");
+        assert_eq!(format!("{}", AppError::AlreadyExists("baz".into())), "Already exists: baz");
+        assert_eq!(format!("{}", AppError::Unauthorized("auth".into())), "Unauthorized: auth");
+        assert_eq!(format!("{}", AppError::Internal("err".into())), "Internal error: err");
+        assert_eq!(format!("{}", AppError::WikimediaFetch("api".into())), "Wikimedia fetch error: api");
+    }
+}

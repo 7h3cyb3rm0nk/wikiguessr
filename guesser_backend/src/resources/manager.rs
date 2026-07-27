@@ -1,219 +1,94 @@
+use crate::config::GameConfig;
+use crate::image::Image;
 use crate::location::coordinates::{Coordinate, ItemId, Location};
-use rand::RngExt;
-use reqwest::Client;
+use crate::resources::cache::ImageCache;
+use crate::resources::commons::CommonsClient;
+use crate::resources::pool::LocationPool;
+use crate::resources::wikidata::WikidataClient;
+use std::sync::Arc;
+use tokio::time::{sleep, Duration};
+use tracing::{debug, error, info, warn};
+
 pub struct ResourceManager {
-    pub http: reqwest::Client,
-    pub locations: Vec<Location>,
+    wikidata: WikidataClient,
+    commons: CommonsClient,
+    pub pool: LocationPool,
+    cache: ImageCache,
 }
-
-use serde::Deserialize;
-
-#[derive(Deserialize)]
-struct SparqlResponse {
-    results: Results,
-}
-
-#[derive(Deserialize)]
-struct Results {
-    bindings: Vec<Binding>,
-}
-
-#[derive(Deserialize)]
-struct Binding {
-    item: ValueField,
-    location: ValueField,
-}
-
-#[derive(Deserialize)]
-struct ValueField {
-    value: String,
-}
-const PAGE_SIZE: usize = 100;
-const MAX_PAGE: usize = 5000;
 
 impl ResourceManager {
-    pub fn new() -> Self {
+    pub fn new(config: &GameConfig) -> Self {
         Self {
-            http: Client::new(),
-            locations: Vec::new(),
+            wikidata: WikidataClient::new(),
+            commons: CommonsClient::new(),
+            pool: LocationPool::new(),
+            cache: ImageCache::new(config.image_cache_ttl_secs, 7200),
         }
     }
 
-    pub async fn load_locations(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let json = self.fetch_locations().await?;
-        self.locations = Self::parse_locations(&json)?;
-        Ok(())
+    /// Pop a pre-fetched location from the pool.
+    pub fn next_location(&self) -> Option<Location> {
+        self.pool.pop()
     }
 
-    pub async fn fetch_locations(&mut self) -> Result<String, reqwest::Error> {
-        let offset = rand::rng().random_range(0..MAX_PAGE);
-        let query = format!(
-            r#"
-        SELECT ?item ?location WHERE {{
-        ?item wdt:P625 ?location.
-         }}
-         LIMIT 100
-         OFFSET {}
-        "#,
-            offset
-        );
-        self.http
-            .get("https://query.wikidata.org/sparql")
-            .query(&[("query", query), ("format", "json".to_string())])
-            .header(reqwest::header::USER_AGENT, "wikiguessr/0.1")
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await
-    }
-
-    pub fn parse_locations(json: &str) -> Result<Vec<Location>, serde_json::Error> {
-        let response: SparqlResponse = serde_json::from_str(json)?;
-        let mut locations = Vec::new();
-
-        for binding in response.results.bindings {
-            let item_id = ItemId(binding.item.value.rsplit('/').next().unwrap().to_owned());
-            let point = binding
-                .location
-                .value
-                .split("Point(")
-                .nth(1)
-                .unwrap()
-                .trim_end_matches(")");
-
-            let mut coords = point.split_whitespace();
-
-            let longitude: f64 = coords.next().unwrap().parse().unwrap();
-            let latitude: f64 = coords.next().unwrap().parse().unwrap();
-
-            locations.push(Location {
-                item_id,
-                coordinate: Coordinate {
-                    latitude,
-                    longitude,
-                },
-            })
+    /// Get images for a location (from cache, or fetch from Commons if miss).
+    pub async fn images_for(&self, item_id: &ItemId, coord: Coordinate) -> Vec<Image> {
+        if let Some(cached) = self.cache.get(item_id) {
+            debug!(item_id = %item_id.0, "image cache hit");
+            return cached;
         }
-        Ok(locations)
+
+        debug!(item_id = %item_id.0, "image cache miss, fetching from Commons");
+        match self.commons.fetch_images(coord, 10000, 20).await {
+            Ok(images) => {
+                self.cache.insert(item_id, images.clone());
+                images
+            }
+            Err(e) => {
+                warn!(item_id = %item_id.0, error = %e, "failed to fetch images from Commons");
+                Vec::new()
+            }
+        }
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    /// Spawns a Tokio background worker task that keeps the location pool refilled.
+    pub fn start_refill_worker(self: Arc<Self>, config: GameConfig) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            info!("started location pool refill worker");
+            let mut backoff = Duration::from_secs(1);
 
-    #[test]
-    fn parses_single_location_with_crs() {
-        let json = r#"
-        {
-            "results": {
-                "bindings": [
-                    {
-                        "item": {
-                            "type": "uri",
-                            "value": "http://www.wikidata.org/entity/Q25908933"
-                        },
-                        "location": {
-                            "datatype": "http://www.opengis.net/ont/geosparql#wktLiteral",
-                            "type": "literal",
-                            "value": "<http://www.wikidata.org/entity/Q3123> Point(-354.53 -79.92)"
+            loop {
+                let current_len = self.pool.len();
+                if current_len < config.pool_refill_threshold {
+                    debug!(
+                        current_len,
+                        threshold = config.pool_refill_threshold,
+                        "refill threshold triggered, fetching batch from Wikidata"
+                    );
+
+                    match self.wikidata.fetch_batch(config.pool_batch_size).await {
+                        Ok(batch) => {
+                            let count = batch.len();
+                            self.pool.push_batch(batch);
+                            info!(count, new_total = self.pool.len(), "refilled location pool");
+                            backoff = Duration::from_secs(1); // Reset backoff on success
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                retry_in_secs = backoff.as_secs(),
+                                "failed to fetch location batch from Wikidata"
+                            );
+                            sleep(backoff).await;
+                            backoff = (backoff * 2).min(Duration::from_secs(60));
+                            continue;
                         }
                     }
-                ]
+                }
+
+                // Check again in 5 seconds
+                sleep(Duration::from_secs(5)).await;
             }
-        }
-        "#;
-
-        let locations = ResourceManager::parse_locations(json).unwrap();
-
-        assert_eq!(locations.len(), 1);
-
-        let location = &locations[0];
-
-        assert_eq!(location.item_id.0, "Q25908933");
-        assert_eq!(location.coordinate.longitude, -354.53);
-        assert_eq!(location.coordinate.latitude, -79.92);
-    }
-
-    #[test]
-    fn parses_multiple_locations_with_crs() {
-        let json = r#"
-        {
-            "results": {
-                "bindings": [
-                    {
-                        "item": {
-                            "type": "uri",
-                            "value": "http://www.wikidata.org/entity/Q25908933"
-                        },
-                        "location": {
-                            "datatype": "http://www.opengis.net/ont/geosparql#wktLiteral",
-                            "type": "literal",
-                            "value": "<http://www.wikidata.org/entity/Q3123> Point(-354.53 -79.92)"
-                        }
-                    },
-                    {
-                        "item": {
-                            "type": "uri",
-                            "value": "http://www.wikidata.org/entity/Q112252041"
-                        },
-                        "location": {
-                            "datatype": "http://www.opengis.net/ont/geosparql#wktLiteral",
-                            "type": "literal",
-                            "value": "<http://www.wikidata.org/entity/Q308> Point(-358.41 -70.34)"
-                        }
-                    }
-                ]
-            }
-        }
-        "#;
-
-        let locations = ResourceManager::parse_locations(json).unwrap();
-
-        assert_eq!(locations.len(), 2);
-
-        assert_eq!(locations[0].item_id.0, "Q25908933");
-        assert_eq!(locations[1].item_id.0, "Q112252041");
-
-        assert_eq!(locations[0].coordinate.longitude, -354.53);
-        assert_eq!(locations[1].coordinate.longitude, -358.41);
-    }
-
-    #[test]
-    fn parses_empty_results() {
-        let json = r#"
-        {
-            "results": {
-                "bindings": []
-            }
-        }
-        "#;
-
-        let locations = ResourceManager::parse_locations(json).unwrap();
-
-        assert!(locations.is_empty());
-    }
-
-    #[test]
-    fn rejects_invalid_json() {
-        assert!(ResourceManager::parse_locations("not json").is_err());
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn fetches_locations_from_wikidata() {
-        let mut manager = ResourceManager::new();
-
-        let json = manager.fetch_locations().await.unwrap();
-        let locations = ResourceManager::parse_locations(&json).unwrap();
-
-        println!("Fetched {} locations", locations.len());
-
-        for location in &locations {
-            println!("{:?}", location);
-        }
-
-        assert!(!locations.is_empty());
+        })
     }
 }
