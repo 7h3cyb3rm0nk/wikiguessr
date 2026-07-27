@@ -1,7 +1,5 @@
-use crate::rooms::types::PlayerId;
+use crate::ids::{PlayerId, RoomId};
 use std::sync::Arc;
-use uuid::Uuid;
-pub type RoomId = Uuid;
 
 #[derive(Debug, Clone)]
 pub struct Room {
@@ -10,9 +8,9 @@ pub struct Room {
 }
 
 impl Room {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            id: Uuid::new_v4(),
+            id: RoomId::new(),
             players: Arc::new(Vec::new()),
         }
     }

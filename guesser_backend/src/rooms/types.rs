@@ -1,3 +1,1 @@
-use uuid::Uuid;
-pub type RoomId = Uuid;
-pub type PlayerId = Uuid;
+pub use crate::ids::{PlayerId, RoomCode, RoomId};

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
  
-use super::location::ItemId;
+use crate::location::coordinates::ItemId;
  
 /// A single Commons image associated with a Location.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
