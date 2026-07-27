@@ -2,7 +2,7 @@ use crate::image::Image;
 use crate::location::coordinates::Coordinate;
 use reqwest::Client;
 use serde::Deserialize;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Terms whose presence in metadata suggests geographic/landscape content.
 const GEO_TERMS: &[&str] = &[

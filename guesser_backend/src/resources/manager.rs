@@ -6,8 +6,8 @@ use crate::resources::commons::CommonsClient;
 use crate::resources::pool::LocationPool;
 use crate::resources::wikidata::WikidataClient;
 use std::sync::Arc;
-use tokio::time::{sleep, Duration};
-use tracing::{debug, error, info, warn};
+use tokio::time::{Duration, sleep};
+use tracing::{debug, info, warn};
 
 pub struct ResourceManager {
     wikidata: WikidataClient,

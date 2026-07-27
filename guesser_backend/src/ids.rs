@@ -33,6 +33,11 @@ impl RoomId {
     }
 }
 
+impl Default for RoomId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl fmt::Display for RoomId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
@@ -87,6 +92,11 @@ impl PlayerId {
     }
 }
 
+impl Default for PlayerId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl fmt::Display for PlayerId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)

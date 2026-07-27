@@ -1,17 +1,16 @@
 use crate::config::GameConfig;
-use crate::ids::{PlayerId, RoomCode, RoomId};
-use crate::location::coordinates::Coordinate;
+use crate::ids::{PlayerId, RoomId};
 use crate::resources::manager::ResourceManager;
 use crate::rooms::commands::RoomCommand;
 use crate::rooms::events::{PlayerStanding, RoomEvent, RoundScore};
-use crate::rooms::state::{PlayerState, RoomState, RoundState};
+use crate::rooms::state::{RoomState, RoundState};
 use crate::rules::{transition, GameStatus, RoomConfig, RoundEvent as PureRoundEvent, RoundNumber};
 use crate::scoring::{score_guess, haversine_distance_meters, ScoringConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::Duration;
 use tracing::{debug, info, warn};
 
 /// Actor that owns all mutable state and game loop logic for a single room.
