@@ -12,7 +12,7 @@ impl Default for ScoringConfig {
     fn default() -> Self {
         Self {
             max_score: 5000,
-            decay_m: 2000.0,
+            decay_m: 2_000_000.0,
         }
     }
 }
@@ -96,5 +96,33 @@ mod tests {
         let a = coord(10.0, 20.0);
         let b = coord(-5.0, 100.0);
         assert!((haversine_distance_meters(a, b) - haversine_distance_meters(b, a)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn scoring_matches_gamejs_decay_curve() {
+        // game.js uses decay = 2000 km: score = 5000 * e^(-d/2000km).
+        // Expected values at these distances (meters):
+        //   10 km  ~4975, 100 km ~4756, 500 km ~3894, 1000 km ~3033, 2000 km ~1839
+        let config = ScoringConfig::default();
+
+        let s10 = score_for_distance(10_000.0, config);
+        let s100 = score_for_distance(100_000.0, config);
+        let s500 = score_for_distance(500_000.0, config);
+        let s1000 = score_for_distance(1_000_000.0, config);
+        let s2000 = score_for_distance(2_000_000.0, config);
+
+        assert!((4900.0..5050.0).contains(&(s10 as f64)), "10km scored {s10}");
+        assert!((4600.0..4900.0).contains(&(s100 as f64)), "100km scored {s100}");
+        assert!((3700.0..4100.0).contains(&(s500 as f64)), "500km scored {s500}");
+        assert!((2900.0..3200.0).contains(&(s1000 as f64)), "1000km scored {s1000}");
+        assert!((1700.0..2000.0).contains(&(s2000 as f64)), "2000km scored {s2000}");
+    }
+
+    fn score_for_distance(distance_m: f64, config: ScoringConfig) -> u32 {
+        let guess = coord(0.0, 0.0);
+        // ~111,320 m per degree at the equator; place the "actual" at the right distance.
+        let degrees = distance_m / 111_320.0;
+        let actual = coord(degrees, 0.0);
+        score_guess(guess, actual, config)
     }
 }

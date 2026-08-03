@@ -48,7 +48,12 @@ pub async fn ws_handler(
     Ok(ws.on_upgrade(move |socket| handle_socket(socket, room_id, player_id, state)))
 }
 
-async fn handle_socket(socket: WebSocket, room_id: crate::ids::RoomId, player_id: PlayerId, state: AppState) {
+async fn handle_socket(
+    socket: WebSocket,
+    room_id: crate::ids::RoomId,
+    player_id: PlayerId,
+    state: AppState,
+) {
     debug!(%room_id, %player_id, "websocket connected");
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
@@ -110,33 +115,36 @@ async fn handle_socket(socket: WebSocket, room_id: crate::ids::RoomId, player_id
             };
 
             let command = match client_msg {
-                ClientWsMessage::Ready => RoomCommand::Ready { player_id },
+                ClientWsMessage::Ready => RoomCommand::Ready {
+                    player_id,
+                    response_tx: None,
+                },
                 ClientWsMessage::Guess {
                     seq,
                     latitude,
                     longitude,
-                } => {
-                    match Coordinate::new(latitude, longitude) {
-                        Ok(coordinate) => RoomCommand::Guess {
-                            player_id,
-                            seq,
-                            coordinate,
-                            response_tx: None,
-                        },
-                        Err(_) => continue,
-                    }
-                }
+                } => match Coordinate::new(latitude, longitude) {
+                    Ok(coordinate) => RoomCommand::Guess {
+                        player_id,
+                        seq,
+                        coordinate,
+                        response_tx: None,
+                    },
+                    Err(_) => continue,
+                },
                 ClientWsMessage::Ping => RoomCommand::Ping { player_id },
                 ClientWsMessage::Leave => RoomCommand::Leave { player_id },
             };
 
-            if let Err(_) = rooms_clone.route(room_id, command).await {
+            if rooms_clone.route(room_id, command).await.is_err() {
                 break;
             }
         }
 
         // On disconnect/leave, inform room actor
-        let _ = rooms_clone.route(room_id, RoomCommand::Leave { player_id }).await;
+        let _ = rooms_clone
+            .route(room_id, RoomCommand::Leave { player_id })
+            .await;
     });
 
     // Wait for either send or receive task to complete

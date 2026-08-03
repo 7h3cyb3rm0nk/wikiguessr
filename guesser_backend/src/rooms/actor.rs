@@ -4,14 +4,14 @@ use crate::resources::manager::ResourceManager;
 use crate::rooms::commands::RoomCommand;
 use crate::rooms::events::{PlayerStanding, RoomEvent, RoundScore};
 use crate::rooms::state::{RoomState, RoundState};
-use crate::rules::{transition, GameStatus, RoomConfig, RoundEvent as PureRoundEvent, RoundNumber};
-use crate::scoring::{score_guess, haversine_distance_meters, ScoringConfig};
+use crate::rules::{GameStatus, RoomConfig, RoundEvent as PureRoundEvent, RoundNumber, transition};
+use crate::scoring::{ScoringConfig, haversine_distance_meters, score_guess};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Actor that owns all mutable state and game loop logic for a single room.
 pub struct RoomActor {
@@ -42,7 +42,7 @@ impl RoomActor {
     /// Broadcast a `RoomEvent` to all connected player channels.
     pub fn broadcast(&mut self, event: RoomEvent) {
         self.broadcast_sinks.retain(|player_id, tx| {
-            if let Err(_) = tx.send(event.clone()) {
+            if tx.send(event.clone()).is_err() {
                 debug!(%player_id, "dropping disconnected player broadcast sink");
                 false
             } else {
@@ -71,12 +71,25 @@ impl RoomActor {
         let mut inactivity_timer = tokio::time::interval(inactivity_duration);
         inactivity_timer.reset();
 
+        // Lobby timeout: destroys a lobby that never starts a game.
+        let lobby_duration = Duration::from_secs(self.state.config.lobby_timeout_secs);
+        let mut lobby_timer = tokio::time::interval(lobby_duration);
+        lobby_timer.reset();
+
+        // 1-second ticker for round deadline checks; no Tick command needed.
+        let mut round_timer = tokio::time::interval(Duration::from_secs(1));
+        round_timer.reset();
+
         loop {
             tokio::select! {
                 cmd_option = self.mailbox.recv() => {
                     match cmd_option {
                         Some(cmd) => {
                             inactivity_timer.reset();
+                            // While in the lobby, any command (join/ready/leave) resets the lobby timer.
+                            if self.state.status == GameStatus::Lobby {
+                                lobby_timer.reset();
+                            }
                             let should_continue = self.handle_command(cmd).await;
                             if !should_continue {
                                 break;
@@ -86,6 +99,24 @@ impl RoomActor {
                             debug!(room_id = %self.state.id, "all mailbox senders dropped, terminating room actor");
                             break;
                         }
+                    }
+                }
+                _ = round_timer.tick() => {
+                    // Round deadline check — fires every second while a round is active.
+                    if let Some(ref round) = self.state.current_round {
+                        let now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        if now_ms >= round.deadline_unix_ms {
+                            self.end_round().await;
+                        }
+                    }
+                }
+                _ = lobby_timer.tick() => {
+                    if self.state.status == GameStatus::Lobby {
+                        info!(room_id = %self.state.id, "lobby timeout reached, destroying room actor");
+                        break;
                     }
                 }
                 _ = inactivity_timer.tick() => {
@@ -105,11 +136,30 @@ impl RoomActor {
             RoomCommand::Join {
                 player_id,
                 name,
+                join_code,
                 response_tx,
             } => {
+                // Validate the join code for multiplayer rooms (solo passes None).
+                if let Some(provided) = join_code
+                    && !provided.eq_ignore_ascii_case(&self.state.join_code)
+                {
+                    if let Some(tx) = response_tx {
+                        let _ = tx.send(Err("invalid_join_code".to_string()));
+                    }
+                    self.send_to(
+                        &player_id,
+                        RoomEvent::Error {
+                            code: "join_error".to_string(),
+                            message: "invalid_join_code".to_string(),
+                        },
+                    );
+                    return true;
+                }
+
                 let token = format!("p_tok_{player_id}");
                 let is_host = self.state.players.is_empty();
-                self.state.add_player(player_id, name.clone(), token, is_host);
+                self.state
+                    .add_player(player_id, name.clone(), token, is_host);
 
                 self.broadcast(RoomEvent::PlayerJoined {
                     player_id,
@@ -130,12 +180,74 @@ impl RoomActor {
                     return false;
                 }
             }
-            RoomCommand::Ready { player_id } => {
+            RoomCommand::Ready {
+                player_id,
+                response_tx,
+            } => {
                 self.state.ready_players.insert(player_id);
                 self.broadcast(RoomEvent::PlayerReady { player_id });
 
                 if self.state.status == GameStatus::Lobby && self.state.all_players_ready() {
                     self.start_next_round().await;
+
+                    // If there's a response channel (solo REST), send the round state
+                    if let Some(tx) = response_tx {
+                        if let Some(ref round) = self.state.current_round {
+                            use crate::rooms::commands::RoundStateSnapshot;
+                            let snapshot = RoundStateSnapshot {
+                                round_number: round.round_number,
+                                total_rounds: self.state.config.total_rounds,
+                                images: round.images.clone(),
+                                deadline_unix_ms: round.deadline_unix_ms,
+                            };
+                            let _ = tx.send(Ok(snapshot));
+                        } else {
+                            let _ = tx.send(Err("round not started".to_string()));
+                        }
+                    }
+                }
+            }
+            RoomCommand::HostStart {
+                host_token,
+                response_tx,
+            } => {
+                // Validate the host token before allowing a force-start.
+                if !host_token.eq_ignore_ascii_case(&self.state.host_token) {
+                    if let Some(tx) = response_tx {
+                        let _ = tx.send(Err("invalid_host_token".to_string()));
+                    }
+                    return true;
+                }
+
+                if self.state.status != GameStatus::Lobby {
+                    if let Some(tx) = response_tx {
+                        let _ = tx.send(Err("game_already_started".to_string()));
+                    }
+                    return true;
+                }
+
+                // Ready every current player, then start the round.
+                let player_ids: Vec<PlayerId> = self.state.players.keys().copied().collect();
+                for pid in &player_ids {
+                    self.state.ready_players.insert(*pid);
+                    self.broadcast(RoomEvent::PlayerReady { player_id: *pid });
+                }
+
+                self.start_next_round().await;
+
+                if let Some(tx) = response_tx {
+                    if let Some(ref round) = self.state.current_round {
+                        use crate::rooms::commands::RoundStateSnapshot;
+                        let snapshot = RoundStateSnapshot {
+                            round_number: round.round_number,
+                            total_rounds: self.state.config.total_rounds,
+                            images: round.images.clone(),
+                            deadline_unix_ms: round.deadline_unix_ms,
+                        };
+                        let _ = tx.send(Ok(snapshot));
+                    } else {
+                        let _ = tx.send(Err("round not started".to_string()));
+                    }
                 }
             }
             RoomCommand::Guess {
@@ -191,18 +303,40 @@ impl RoomActor {
             RoomCommand::RegisterSink { player_id, sink_tx } => {
                 self.register_sink(player_id, sink_tx);
             }
-            RoomCommand::Tick => {
-                // Internal timer tick to check round timeout
-                if let Some(ref round) = self.state.current_round {
-                    let now_ms = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-
-                    if now_ms >= round.deadline_unix_ms {
-                        self.end_round().await;
+            RoomCommand::GetRoundState { response_tx } => {
+                let snapshot = self.state.current_round.as_ref().map(|r| {
+                    use crate::rooms::commands::RoundStateSnapshot;
+                    RoundStateSnapshot {
+                        round_number: r.round_number,
+                        total_rounds: self.state.config.total_rounds,
+                        images: r.images.clone(),
+                        deadline_unix_ms: r.deadline_unix_ms,
                     }
-                }
+                });
+                let _ = response_tx.send(snapshot);
+            }
+            RoomCommand::GetRoundResult {
+                player_id,
+                response_tx,
+            } => {
+                let snapshot = self.state.last_round_result.as_ref().and_then(|rr| {
+                    // Find the score for this specific player
+                    let player_score = rr.scores.iter().find(|s| s.player_id == player_id);
+                    player_score.map(|s| {
+                        use crate::rooms::commands::RoundResultSnapshot;
+                        RoundResultSnapshot {
+                            round: rr.round,
+                            score: s.score,
+                            distance_meters: s.distance_meters,
+                            actual_location: rr.actual_location,
+                            item_id: rr.item_id.clone(),
+                            leaderboard: rr.leaderboard.clone(),
+                            game_finished: rr.game_finished,
+                            final_standings: rr.final_standings.clone(),
+                        }
+                    })
+                });
+                let _ = response_tx.send(snapshot);
             }
         }
         true
@@ -213,27 +347,26 @@ impl RoomActor {
         let rule_config = RoomConfig {
             total_rounds: self.state.config.total_rounds,
         };
-        self.state.status = transition(self.state.status, PureRoundEvent::AllPlayersReady, rule_config);
+
+        // If we're still in Lobby, this is the first round — transition via AllPlayersReady.
+        // If we're in InRound(prev), end_round() already advanced us — no transition needed.
+        if self.state.status == GameStatus::Lobby {
+            self.state.status = transition(
+                self.state.status,
+                PureRoundEvent::AllPlayersReady,
+                rule_config,
+            );
+        }
 
         let round_number = match self.state.status {
             GameStatus::InRound(RoundNumber(n)) => n,
             _ => return,
         };
 
-        // Fetch location from pool or fallback
-        let location = match self.resources.next_location() {
-            Some(loc) => loc,
-            None => {
-                warn!(room_id = %self.state.id, "location pool empty when starting round");
-                return;
-            }
-        };
-
-        // Fetch images for this location
-        let images = self
-            .resources
-            .images_for(&location.item_id, location.coordinate)
-            .await;
+        // Fetch prepared round from pool (now async and waits up to 10s)
+        let prepared = self.resources.next_location().await;
+        let location = prepared.location;
+        let images = prepared.images;
 
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -301,9 +434,9 @@ impl RoomActor {
 
         self.broadcast(RoomEvent::RoundEnded {
             round: round.round_number,
-            scores: round_scores,
+            scores: round_scores.clone(),
             actual_location: actual,
-            item_id: round.location.item_id,
+            item_id: round.location.item_id.clone(),
         });
 
         // Compute standings
@@ -317,7 +450,7 @@ impl RoomActor {
                 score: p.cumulative_score,
             })
             .collect();
-        standings.sort_by(|a, b| b.score.cmp(&a.score));
+        standings.sort_by_key(|p| std::cmp::Reverse(p.score));
 
         self.broadcast(RoomEvent::Leaderboard {
             standings: standings.clone(),
@@ -329,7 +462,23 @@ impl RoomActor {
         };
         self.state.status = transition(self.state.status, PureRoundEvent::RoundEnded, rule_config);
 
-        if self.state.status == GameStatus::Finished {
+        // Store round result for solo REST players
+        let finished = self.state.status == GameStatus::Finished;
+        self.state.last_round_result = Some(crate::rooms::state::RoundResult {
+            round: round.round_number,
+            scores: round_scores,
+            actual_location: actual,
+            item_id: round.location.item_id,
+            leaderboard: standings.clone(),
+            game_finished: finished,
+            final_standings: if finished {
+                Some(standings.clone())
+            } else {
+                None
+            },
+        });
+
+        if finished {
             self.broadcast(RoomEvent::GameFinished {
                 final_standings: standings,
             });
@@ -344,20 +493,48 @@ impl RoomActor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::location::coordinates::{ItemId, Location};
+    use crate::location::coordinates::{Coordinate, ItemId, Location};
+    use crate::resources::pool::PreparedRound;
     use tokio::sync::oneshot;
 
-    fn setup_actor_with_location() -> (RoomActor, mpsc::Sender<RoomCommand>, mpsc::UnboundedReceiver<RoomEvent>, PlayerId) {
+    fn setup_actor_with_location() -> (
+        RoomActor,
+        mpsc::Sender<RoomCommand>,
+        mpsc::UnboundedReceiver<RoomEvent>,
+        PlayerId,
+    ) {
         let config = GameConfig::default();
         let resources = Arc::new(ResourceManager::new(&config));
         resources.pool.push_batch(vec![
-            Location {
-                item_id: ItemId("Q42".into()),
-                coordinate: Coordinate { latitude: 51.5074, longitude: -0.1278 },
+            PreparedRound {
+                location: Location {
+                    item_id: ItemId("Q42".into()),
+                    coordinate: Coordinate {
+                        latitude: 51.5074,
+                        longitude: -0.1278,
+                    },
+                },
+                images: vec![crate::image::Image {
+                    url: "test".into(),
+                    thumb_url: "test".into(),
+                    width: 100,
+                    height: 100,
+                }],
             },
-            Location {
-                item_id: ItemId("Q100".into()),
-                coordinate: Coordinate { latitude: 48.8566, longitude: 2.3522 },
+            PreparedRound {
+                location: Location {
+                    item_id: ItemId("Q100".into()),
+                    coordinate: Coordinate {
+                        latitude: 48.8566,
+                        longitude: 2.3522,
+                    },
+                },
+                images: vec![crate::image::Image {
+                    url: "test".into(),
+                    thumb_url: "test".into(),
+                    width: 100,
+                    height: 100,
+                }],
             },
         ]);
 
@@ -384,38 +561,73 @@ mod tests {
 
         // Join p1
         let (join_tx, join_rx) = oneshot::channel();
-        actor.handle_command(RoomCommand::Join {
-            player_id: p1,
-            name: "Alice".into(),
-            response_tx: Some(join_tx),
-        }).await;
+        actor
+            .handle_command(RoomCommand::Join {
+                player_id: p1,
+                name: "Alice".into(),
+                join_code: None,
+                response_tx: Some(join_tx),
+            })
+            .await;
 
         assert!(join_rx.await.unwrap().is_ok());
         let event = event_rx.recv().await.unwrap();
-        assert_eq!(event, RoomEvent::PlayerJoined { player_id: p1, name: "Alice".into() });
+        assert_eq!(
+            event,
+            RoomEvent::PlayerJoined {
+                player_id: p1,
+                name: "Alice".into()
+            }
+        );
 
         // Leave p1 -> actor should report false (terminate)
-        let continue_loop = actor.handle_command(RoomCommand::Leave { player_id: p1 }).await;
-        assert!(!continue_loop, "actor should terminate when last player leaves");
+        let continue_loop = actor
+            .handle_command(RoomCommand::Leave { player_id: p1 })
+            .await;
+        assert!(
+            !continue_loop,
+            "actor should terminate when last player leaves"
+        );
     }
 
     #[tokio::test]
     async fn actor_ready_starts_round_and_broadcasts() {
         let (mut actor, _tx, mut event_rx, p1) = setup_actor_with_location();
 
-        actor.handle_command(RoomCommand::Join { player_id: p1, name: "Alice".into(), response_tx: None }).await;
+        actor
+            .handle_command(RoomCommand::Join {
+                player_id: p1,
+                name: "Alice".into(),
+                join_code: None,
+                response_tx: None,
+            })
+            .await;
         let _ = event_rx.recv().await; // Drain PlayerJoined
 
-        actor.handle_command(RoomCommand::Ready { player_id: p1 }).await;
+        actor
+            .handle_command(RoomCommand::Ready {
+                player_id: p1,
+                response_tx: None,
+            })
+            .await;
 
         let ready_event = event_rx.recv().await.unwrap();
         assert_eq!(ready_event, RoomEvent::PlayerReady { player_id: p1 });
 
         let round_event = event_rx.recv().await.unwrap();
         match round_event {
-            RoomEvent::RoundStarted { round, total_rounds, .. } => {
+            RoomEvent::RoundStarted {
+                round,
+                total_rounds,
+                images,
+                ..
+            } => {
                 assert_eq!(round, 1);
                 assert_eq!(total_rounds, 5);
+                assert!(
+                    !images.is_empty(),
+                    "round should include fallback images for guessing"
+                );
             }
             other => panic!("expected RoundStarted, got {:?}", other),
         }
@@ -425,26 +637,49 @@ mod tests {
     async fn actor_guess_and_scoring() {
         let (mut actor, _tx, mut event_rx, p1) = setup_actor_with_location();
 
-        actor.handle_command(RoomCommand::Join { player_id: p1, name: "Alice".into(), response_tx: None }).await;
-        actor.handle_command(RoomCommand::Ready { player_id: p1 }).await;
+        actor
+            .handle_command(RoomCommand::Join {
+                player_id: p1,
+                name: "Alice".into(),
+                join_code: None,
+                response_tx: None,
+            })
+            .await;
+        actor
+            .handle_command(RoomCommand::Ready {
+                player_id: p1,
+                response_tx: None,
+            })
+            .await;
         let _ = event_rx.recv().await; // Joined
         let _ = event_rx.recv().await; // Ready
         let _ = event_rx.recv().await; // RoundStarted
 
         // Submit guess for exact location (51.5074, -0.1278) -> should score 5000 max score
         let (guess_tx, guess_rx) = oneshot::channel();
-        actor.handle_command(RoomCommand::Guess {
-            player_id: p1,
-            seq: 1,
-            coordinate: Coordinate { latitude: 51.5074, longitude: -0.1278 },
-            response_tx: Some(guess_tx),
-        }).await;
+        actor
+            .handle_command(RoomCommand::Guess {
+                player_id: p1,
+                seq: 1,
+                coordinate: Coordinate {
+                    latitude: 51.5074,
+                    longitude: -0.1278,
+                },
+                response_tx: Some(guess_tx),
+            })
+            .await;
 
         let score = guess_rx.await.unwrap().unwrap();
         assert_eq!(score, 5000);
 
         let ack = event_rx.recv().await.unwrap();
-        assert_eq!(ack, RoomEvent::GuessAck { player_id: p1, seq: 1 });
+        assert_eq!(
+            ack,
+            RoomEvent::GuessAck {
+                player_id: p1,
+                seq: 1
+            }
+        );
 
         let round_ended = event_rx.recv().await.unwrap();
         assert!(matches!(round_ended, RoomEvent::RoundEnded { .. }));

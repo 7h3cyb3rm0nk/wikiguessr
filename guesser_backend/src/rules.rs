@@ -56,13 +56,13 @@ pub fn transition(current: GameStatus, event: RoundEvent, config: RoomConfig) ->
     }
 }
 
-pub fn is_terminal(status: GameStatus) -> bool {
-    matches!(status, GameStatus::Finished)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    pub fn is_terminal(status: GameStatus) -> bool {
+        matches!(status, GameStatus::Finished)
+    }
 
     #[test]
     fn lobby_to_round_one_on_ready() {
@@ -94,7 +94,10 @@ mod tests {
         let config = RoomConfig::default();
         let status = GameStatus::InRound(RoundNumber(2));
         let next = transition(status, RoundEvent::AllPlayersReady, config);
-        assert_eq!(next, status, "unexpected event should be a no-op, not a panic");
+        assert_eq!(
+            next, status,
+            "unexpected event should be a no-op, not a panic"
+        );
     }
 
     #[test]
@@ -109,7 +112,10 @@ mod tests {
         let config = RoomConfig::default();
         let status = GameStatus::Finished;
         assert_eq!(transition(status, RoundEvent::RoundEnded, config), status);
-        assert_eq!(transition(status, RoundEvent::AllPlayersReady, config), status);
+        assert_eq!(
+            transition(status, RoundEvent::AllPlayersReady, config),
+            status
+        );
     }
 
     #[test]

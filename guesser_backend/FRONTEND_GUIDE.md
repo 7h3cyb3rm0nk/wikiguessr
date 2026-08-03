@@ -54,11 +54,20 @@ Single-player mode requires no WebSockets. It uses simple HTTP `POST` requests.
   "player_id": 1042,
   "player_token": "p_tok_1042",
   "total_rounds": 5,
-  "round_duration_secs": 60
+  "round_duration_secs": 60,
+  "images": [
+    {
+      "url": "https://upload.wikimedia.org/.../image.jpg",
+      "thumb_url": "https://upload.wikimedia.org/.../800px-image.jpg",
+      "width": 1920,
+      "height": 1080
+    }
+  ],
+  "deadline_unix_ms": 1785189200000
 }
 ```
 
-> **Client Action**: Store `room_code` and `player_id` in local session state. Render round 1 immediately.
+> **Client Action**: Store `room_code` and `player_id` in local session state. Round 1 images are included — render them immediately.
 
 ---
 
@@ -84,6 +93,57 @@ Single-player mode requires no WebSockets. It uses simple HTTP `POST` requests.
   "status": "success"
 }
 ```
+
+---
+
+### 2.3 Fetch Current Round (optional)
+
+If the player is mid-game (e.g. after a round auto-advances), fetch the current round images:
+
+- **Endpoint**: `GET /api/solo/round?room_code=X7K2M3`
+- **Response**: `200 OK`
+
+```json
+{
+  "round_number": 2,
+  "total_rounds": 5,
+  "images": [
+    {
+      "url": "https://upload.wikimedia.org/.../image.jpg",
+      "thumb_url": "https://upload.wikimedia.org/.../800px-image.jpg",
+      "width": 1920,
+      "height": 1080
+    }
+  ],
+  "deadline_unix_ms": 1785189800000
+}
+```
+
+---
+
+### 2.4 Fetch Round Result / Reveal
+
+After guessing (or on deadline expiry), fetch the actual location, score, and standings:
+
+- **Endpoint**: `GET /api/solo/round/result?room_code=X7K2M3&player_id=1042`
+- **Response**: `200 OK`
+
+```json
+{
+  "round": 1,
+  "score": 4850,
+  "distance_meters": 1420.5,
+  "actual_location": { "latitude": 48.8566, "longitude": 2.3522 },
+  "item_id": "Q42",
+  "leaderboard": [
+    { "player_id": 1042, "name": "Solo Player", "score": 4850 }
+  ],
+  "game_finished": false,
+  "final_standings": null
+}
+```
+
+> **Client Action**: Draw the result polyline from the player's guess to `actual_location`. If `game_finished` is `true`, show the final screen using `final_standings`.
 
 ---
 
@@ -130,9 +190,46 @@ Multiplayer uses REST endpoints to create/join lobbies and WebSocket for real-ti
 }
 ```
 
+> **Note**: The provided `join_code` is validated server-side. A mismatched code returns `400 Bad Request`.
+
 ---
 
-### 3.3 Connect to Room WebSocket
+### 3.3 Host Start (optional)
+
+If the host wants to start the game immediately (instead of waiting for all players to send `ready`), they can force-start:
+
+- **Endpoint**: `POST /api/rooms/:code/start`
+- **Request Body**:
+
+```json
+{
+  "host_token": "host_tok_91823719"
+}
+```
+
+- **Response**: `200 OK`
+
+```json
+{
+  "round": 1,
+  "total_rounds": 5,
+  "images": [
+    {
+      "url": "https://upload.wikimedia.org/.../image.jpg",
+      "thumb_url": "https://upload.wikimedia.org/.../800px-image.jpg",
+      "width": 1920,
+      "height": 1080
+    }
+  ],
+  "deadline_unix_ms": 1785189200000
+}
+```
+
+> **Note**: An invalid `host_token` returns `401 Unauthorized`.
+
+---
+
+### 3.4 Connect to Room WebSocket
 
 - **WebSocket URL**: `ws://HOST:PORT/api/ws?room_code=K9M2P4&player_id=2045`
 

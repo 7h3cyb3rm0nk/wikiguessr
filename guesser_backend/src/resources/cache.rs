@@ -61,15 +61,16 @@ impl ImageCache {
         let ttl = self.base_ttl + Duration::from_secs(jitter_offset) - self.jitter;
         let expires_at = Instant::now() + ttl;
 
-        self.entries.insert(
-            item_id.0.clone(),
-            CachedEntry { images, expires_at },
-        );
+        self.entries
+            .insert(item_id.0.clone(), CachedEntry { images, expires_at });
     }
 
     /// Number of entries currently in the cache (including potentially expired).
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 

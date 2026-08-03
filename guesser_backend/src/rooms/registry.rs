@@ -23,9 +23,13 @@ impl RoomRegistry {
 
     /// Create a new room actor, spawn its task, and store its mailbox sender.
     ///
+    /// A cleanup task removes the room from the registry once the actor
+    /// terminates (inactivity timeout, last player leave, or mailbox closed),
+    /// preventing stale entries from leaking.
+    ///
     /// Returns `(room_id, room_code, join_code, host_token, sender)`.
     pub fn create_room(
-        &self,
+        self: Arc<Self>,
         config: GameConfig,
         resources: Arc<ResourceManager>,
     ) -> (RoomId, RoomCode, String, String, mpsc::Sender<RoomCommand>) {
@@ -45,10 +49,16 @@ impl RoomRegistry {
             rx,
         );
 
-        tokio::spawn(actor.run());
-
+        // Register before spawning so the cleanup task always finds the entries.
         self.rooms.insert(id, tx.clone());
         self.codes.insert(code.clone(), id);
+
+        let handle = tokio::spawn(actor.run());
+        let registry = self.clone();
+        tokio::spawn(async move {
+            let _ = handle.await;
+            registry.remove(id);
+        });
 
         info!(%id, %code, "registered and spawned new room actor");
         (id, code, join_code, host_token, tx)
@@ -95,24 +105,76 @@ impl RoomRegistry {
     pub fn len(&self) -> usize {
         self.rooms.len()
     }
+    #[allow(unused)]
+    pub fn is_empty(&self) -> bool {
+        self.rooms.is_empty()
+    }
 }
-
+impl Default for RoomRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[tokio::test]
     async fn create_and_route_to_room() {
-        let registry = RoomRegistry::new();
+        let registry = Arc::new(RoomRegistry::new());
         let config = GameConfig::default();
         let resources = Arc::new(ResourceManager::new(&config));
 
-        let (id, code, _join_code, _host_token, _tx) = registry.create_room(config, resources);
+        let (id, code, _join_code, _host_token, _tx) =
+            registry.clone().create_room(config, resources);
         assert_eq!(registry.len(), 1);
 
         assert_eq!(registry.get_id_by_code(&code), Some(id));
 
-        let ping_res = registry.route(id, RoomCommand::Ping { player_id: crate::ids::PlayerId(1) }).await;
+        let ping_res = registry
+            .route(
+                id,
+                RoomCommand::Ping {
+                    player_id: crate::ids::PlayerId(1),
+                },
+            )
+            .await;
         assert!(ping_res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn room_is_removed_when_actor_terminates() {
+        let registry = Arc::new(RoomRegistry::new());
+        let config = GameConfig::default();
+        let resources = Arc::new(ResourceManager::new(&config));
+
+        let (id, code, _join_code, _host_token, _tx) =
+            registry.clone().create_room(config, resources);
+        assert_eq!(registry.len(), 1);
+
+        // Terminate the room by leaving the last player.
+        let player_id = crate::ids::PlayerId(999);
+        let _ = registry
+            .route_by_code(
+                &code,
+                RoomCommand::Join {
+                    player_id,
+                    name: "Solo".to_string(),
+                    join_code: None,
+                    response_tx: None,
+                },
+            )
+            .await;
+        let _ = registry.route(id, RoomCommand::Leave { player_id }).await;
+
+        // Give the cleanup task a moment to observe actor termination.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert_eq!(
+            registry.len(),
+            0,
+            "terminated room should be removed from registry"
+        );
+        assert_eq!(registry.get_id_by_code(&code), None);
     }
 }

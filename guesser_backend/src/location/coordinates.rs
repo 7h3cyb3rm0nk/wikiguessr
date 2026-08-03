@@ -57,13 +57,14 @@ impl ItemId {
         Self(id)
     }
 }
-/// A player's submitted guess for a round. Distinct from `Location`
-/// because a guess has no `item_id` — the player doesn't know what
-/// the target's Wikidata item is, only where they clicked.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct Guess {
-    pub coordinate: Coordinate,
-}
+//  A player's submitted guess for a round. Distinct from `Location`
+//  because a guess has no `item_id` — the player doesn't know what
+// the target's Wikidata item is, only where they clicked.
+// #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+// pub struct Guess {
+//     pub coordinate: Coordinate,
+// }
+//
 
 #[cfg(test)]
 mod tests {

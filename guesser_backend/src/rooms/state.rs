@@ -1,7 +1,8 @@
 use crate::config::GameConfig;
 use crate::ids::{PlayerId, RoomCode, RoomId};
 use crate::image::Image;
-use crate::location::coordinates::{Coordinate, Location};
+use crate::location::coordinates::{Coordinate, ItemId, Location};
+use crate::rooms::events::{PlayerStanding, RoundScore};
 use crate::rules::GameStatus;
 use std::collections::{HashMap, HashSet};
 
@@ -26,6 +27,18 @@ pub struct RoundState {
     pub guesses: HashMap<PlayerId, Coordinate>,
 }
 
+/// Result of a completed round, stored for solo players to fetch.
+#[derive(Debug, Clone)]
+pub struct RoundResult {
+    pub round: u8,
+    pub scores: Vec<RoundScore>,
+    pub actual_location: Coordinate,
+    pub item_id: ItemId,
+    pub leaderboard: Vec<PlayerStanding>,
+    pub game_finished: bool,
+    pub final_standings: Option<Vec<PlayerStanding>>,
+}
+
 /// Inner state of a room, owned exclusively by its `RoomActor` task.
 #[derive(Debug, Clone)]
 pub struct RoomState {
@@ -37,6 +50,7 @@ pub struct RoomState {
     pub players: HashMap<PlayerId, PlayerState>,
     pub ready_players: HashSet<PlayerId>,
     pub current_round: Option<RoundState>,
+    pub last_round_result: Option<RoundResult>,
     pub config: GameConfig,
 }
 
@@ -52,6 +66,7 @@ impl RoomState {
             players: HashMap::new(),
             ready_players: HashSet::new(),
             current_round: None,
+            last_round_result: None,
             config,
         }
     }

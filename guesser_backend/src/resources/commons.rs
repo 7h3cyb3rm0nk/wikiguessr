@@ -1,23 +1,67 @@
 use crate::image::Image;
 use crate::location::coordinates::Coordinate;
 use reqwest::Client;
+use reqwest::StatusCode;
 use serde::Deserialize;
+use tokio::time::{Duration, sleep};
 use tracing::debug;
+
+const REQUEST_TIMEOUT_SECS: u64 = 10;
+const MAX_RETRIES: usize = 3;
 
 /// Terms whose presence in metadata suggests geographic/landscape content.
 const GEO_TERMS: &[&str] = &[
-    "landscape", "panorama", "aerial", "mountain", "river", "lake", "coast",
-    "valley", "forest", "desert", "glacier", "waterfall", "canyon", "plain",
-    "island", "bay", "cape", "beach", "cliff", "hill", "volcano", "geography",
-    "natural", "scenery", "terrain", "vegetation", "wetland", "estuary",
+    "landscape",
+    "panorama",
+    "aerial",
+    "mountain",
+    "river",
+    "lake",
+    "coast",
+    "valley",
+    "forest",
+    "desert",
+    "glacier",
+    "waterfall",
+    "canyon",
+    "plain",
+    "island",
+    "bay",
+    "cape",
+    "beach",
+    "cliff",
+    "hill",
+    "volcano",
+    "geography",
+    "natural",
+    "scenery",
+    "terrain",
+    "vegetation",
+    "wetland",
+    "estuary",
 ];
 
 /// Terms identifying satellite/orbital imagery — excluded outright.
 const SPACE_TERMS: &[&str] = &[
-    "satellite image", "satellite view", "satellite photo", "satellite picture",
-    "from space", "seen from orbit", "landsat", "sentinel-2", "copernicus",
-    "earth observatory", "international space station", "space station",
-    "astronaut photograph", "spot image", "worldview-",
+    "satellite image",
+    "satellite view",
+    "satellite photo",
+    "satellite picture",
+    "from space",
+    "seen from orbit",
+    "landsat",
+    "sentinel-2",
+    "copernicus",
+    "earth observatory",
+    "international space station",
+    "space station",
+    "astronaut photograph",
+    "spot image",
+    "worldview-",
+    "weather satellite",
+    "earth from orbit",
+    "modis",
+    "nasa",
 ];
 
 /// Category keywords that indicate non-geographic content.
@@ -81,8 +125,61 @@ struct Candidate {
 
 impl CommonsClient {
     pub fn new() -> Self {
-        Self {
-            http: Client::new(),
+        let http = Client::builder()
+            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+            .build()
+            .expect("failed to build reqwest client");
+        Self { http }
+    }
+
+    /// Fetch the Commons geosearch response with a small retry/backoff loop.
+    ///
+    /// Retries connect errors, HTTP 429 (rate limit), and 5xx responses up to
+    /// `MAX_RETRIES` times with exponential backoff. Non-retryable HTTP statuses
+    /// (e.g. 4xx) surface as an error immediately.
+    async fn request_geosearch(
+        &self,
+        params: &[(&str, String)],
+    ) -> Result<QueryResponse, reqwest::Error> {
+        let mut attempt = 0;
+        let mut backoff = Duration::from_millis(500);
+
+        loop {
+            let result = self
+                .http
+                .get("https://commons.wikimedia.org/w/api.php")
+                .query(params)
+                .header(reqwest::header::USER_AGENT, "wikiguessr-backend/0.1")
+                .send()
+                .await;
+
+            match result {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        return resp.json::<QueryResponse>().await;
+                    }
+                    let retryable =
+                        status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+                    if !retryable || attempt >= MAX_RETRIES {
+                        return Err(resp.error_for_status().err().unwrap());
+                    }
+                }
+                Err(e) => {
+                    if attempt >= MAX_RETRIES {
+                        return Err(e);
+                    }
+                }
+            }
+
+            attempt += 1;
+            debug!(
+                attempt,
+                retry_in_ms = backoff.as_millis(),
+                "retrying Commons request"
+            );
+            sleep(backoff).await;
+            backoff = backoff.saturating_mul(2);
         }
     }
 
@@ -105,35 +202,32 @@ impl CommonsClient {
             ("ggsprimary", "all".to_string()),
             ("ggsnamespace", "6".to_string()),
             ("ggsradius", radius_m.to_string()),
-            ("ggscoord", format!("{}|{}", coord.latitude, coord.longitude)),
+            (
+                "ggscoord",
+                format!("{}|{}", coord.latitude, coord.longitude),
+            ),
             ("ggslimit", "50".to_string()),
             ("prop", "imageinfo".to_string()),
             ("iiprop", "url|extmetadata|mediatype|size".to_string()),
             ("iiurlwidth", "800".to_string()),
         ];
 
-        let resp: QueryResponse = self
-            .http
-            .get("https://commons.wikimedia.org/w/api.php")
-            .query(&params)
-            .header(reqwest::header::USER_AGENT, "wikiguessr-backend/0.1")
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let resp: QueryResponse = self.request_geosearch(&params).await?;
 
         let pages = match resp.query {
             Some(q) => q.pages,
             None => {
-                debug!("Commons returned no pages for coord ({}, {})", coord.latitude, coord.longitude);
+                debug!(
+                    "Commons returned no pages for coord ({}, {})",
+                    coord.latitude, coord.longitude
+                );
                 return Ok(Vec::new());
             }
         };
 
         let mut candidates: Vec<Candidate> = Vec::new();
 
-        for (_page_id, page) in &pages {
+        for page in pages.values() {
             let info = match page.imageinfo.as_ref().and_then(|ii| ii.first()) {
                 Some(i) => i,
                 None => continue,
@@ -193,7 +287,7 @@ impl CommonsClient {
         }
 
         // Sort by geo-relevance descending, take top `limit`.
-        candidates.sort_by(|a, b| b.geo_score.cmp(&a.geo_score));
+        candidates.sort_by_key(|a| std::cmp::Reverse(a.geo_score));
         candidates.truncate(limit);
 
         let images = candidates
@@ -207,6 +301,12 @@ impl CommonsClient {
             .collect();
 
         Ok(images)
+    }
+}
+
+impl Default for CommonsClient {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -227,6 +327,20 @@ mod tests {
     fn space_terms_detected() {
         let text = "landsat satellite image of earth";
         assert!(SPACE_TERMS.iter().any(|t| text.contains(t)));
+    }
+
+    #[test]
+    fn new_satellite_terms_detected() {
+        for text in [
+            "nasa modis image of the atlantic",
+            "weather satellite composite",
+            "earth from orbit captured yesterday",
+        ] {
+            assert!(
+                SPACE_TERMS.iter().any(|t| text.contains(t)),
+                "expected {text} to be excluded"
+            );
+        }
     }
 
     #[test]

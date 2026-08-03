@@ -1,7 +1,7 @@
 use std::env;
 
 /// Top-level application configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Config {
     pub game: GameConfig,
     pub server: ServerConfig,
@@ -16,7 +16,8 @@ pub struct GameConfig {
     pub round_duration_secs: u64,
     /// Maximum points awarded for a perfect guess.
     pub max_score: u32,
-    /// Exponential decay constant (meters). Higher = more forgiving.
+    /// Exponential decay constant (meters). Defaults to 2000 km, matching the
+    /// original game.js scoring curve (~3900 pts at 100 km, ~2100 at 500 km).
     pub scoring_decay_m: f64,
     /// Target number of pre-fetched locations in the pool.
     pub pool_target_size: usize,
@@ -24,6 +25,8 @@ pub struct GameConfig {
     pub pool_refill_threshold: usize,
     /// Number of locations to fetch per Wikidata batch.
     pub pool_batch_size: usize,
+    /// Number of images shown per round (a fixed 7-column grid).
+    pub images_per_round: usize,
     /// Base TTL for cached image sets (seconds). Jitter is added on top.
     pub image_cache_ttl_secs: u64,
     /// Destroy a room after this many seconds of inactivity.
@@ -47,13 +50,14 @@ impl Default for GameConfig {
             total_rounds: 5,
             round_duration_secs: 60,
             max_score: 5000,
-            scoring_decay_m: 2000.0,
+            scoring_decay_m: 2_000_000.0,
             pool_target_size: 1000,
             pool_refill_threshold: 300,
             pool_batch_size: 200,
+            images_per_round: 21,
             image_cache_ttl_secs: 24 * 60 * 60, // 24 hours
-            inactivity_timeout_secs: 300,        // 5 minutes
-            lobby_timeout_secs: 120,             // 2 minutes
+            inactivity_timeout_secs: 300,       // 5 minutes
+            lobby_timeout_secs: 120,            // 2 minutes
         }
     }
 }
@@ -63,15 +67,6 @@ impl Default for ServerConfig {
         Self {
             host: "0.0.0.0".to_string(),
             port: 3000,
-        }
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            game: GameConfig::default(),
-            server: ServerConfig::default(),
         }
     }
 }
@@ -107,6 +102,7 @@ impl Config {
                     d.game.pool_refill_threshold,
                 ),
                 pool_batch_size: env_or("WIKIGUESSR_POOL_BATCH_SIZE", d.game.pool_batch_size),
+                images_per_round: env_or("WIKIGUESSR_IMAGES_PER_ROUND", d.game.images_per_round),
                 image_cache_ttl_secs: env_or(
                     "WIKIGUESSR_IMAGE_CACHE_TTL_SECS",
                     d.game.image_cache_ttl_secs,

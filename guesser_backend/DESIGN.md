@@ -102,7 +102,8 @@ When a location is loaded for a round, `CommonsClient` fetches up to 50 candidat
 1. **Format Exclusion**: Rejects non-`BITMAP` media (SVG, PDF, audio, video).
 2. **Category Exclusion**: Rejects portraits, logos, coats of arms, and flags.
 3. **Satellite Exclusion**: Rejects orbital/space imagery matching terms like `"satellite image"`, `"landsat"`, `"copernicus"`, `"from space"`.
-4. **Geo-Relevance Scoring**: Ranks remaining images by matching 28 terrain keywords (`landscape`, `mountain`, `river`, `valley`, `coast`, `volcano`, etc.) and returns the top 20 image URLs.
+4. **Geo-Relevance Scoring**: Ranks remaining images by matching 28 terrain keywords (`landscape`, `mountain`, `river`, `valley`, `coast`, `volcano`, etc.) and returns the top `images_per_round` (default 21) image URLs.
+5. **Grid Guarantee**: The returned set is normalized to exactly `images_per_round` images — truncated if Commons yields more, padded with distinct generated fallback SVGs if it yields fewer (or fails). This keeps the 7-column grid full every round.
 
 ### Image Cache with Jittered TTL
 Fetched image sets are cached in `ImageCache` using a `DashMap`. To avoid thundering herd expirations:
@@ -131,7 +132,9 @@ $$\text{distance} = 2 \cdot R \cdot \arcsin\left(\sqrt{\sin^2\left(\frac{\Delta 
 
 Points (0 to 5,000) decay exponentially with distance:
 
-$$\text{score} = \text{clamp}\left(\operatorname{round}\left(5000 \cdot e^{-\frac{\text{distance}}{2000\text{m}}}\right), 0, 5000\right)$$
+$$\text{score} = \text{clamp}\left(\operatorname{round}\left(5000 \cdot e^{-\frac{\text{distance}}{2000\text{km}}}\right), 0, 5000\right)$$
+
+> **Decay note**: the decay constant is 2000 km (2 000 000 m), matching the original `game.js` curve (≈4 750 pts at 100 km, ≈3 900 at 500 km). It is configurable via `WIKIGUESSR_SCORING_DECAY_M`.
 
 ### Guess Idempotency
 Each player has exactly one guess slot per round (`HashMap<PlayerId, Coordinate>`). Duplicate guesses within the same round return an `already_guessed` error.
@@ -144,11 +147,14 @@ Each player has exactly one guess slot per round (`HashMap<PlayerId, Coordinate>
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/solo/start` | Spawns a 1-player room, readies player, returns `room_code`, `player_id`, `player_token`. |
+| `POST` | `/api/solo/start` | Spawns a 1-player room, readies player, returns `room_code`, `player_id`, `player_token`, round-1 `images`, and `deadline_unix_ms`. |
 | `POST` | `/api/solo/guess` | Submits guess coordinates `{room_code, player_id, latitude, longitude}`, returns score. |
+| `GET` | `/api/solo/round` | Fetches the current round state `{round_number, total_rounds, images, deadline_unix_ms}` for a solo player. |
+| `GET` | `/api/solo/round/result` | Fetches the round reveal `{score, actual_location, item_id, leaderboard, game_finished}` for a solo player. |
 | `POST` | `/api/rooms` | Creates a multiplayer room, returns `room_id`, `room_code`, `join_code`, `host_token`. |
 | `GET` | `/api/rooms/:code` | Returns room availability status `{room_code, active}`. |
-| `POST` | `/api/rooms/:code/join` | Joins a multiplayer room with `join_code` & `name`, returns `player_id` & `player_token`. |
+| `POST` | `/api/rooms/:code/join` | Joins a multiplayer room with `join_code` & `name`, returns `player_id` & `player_token`. `join_code` is validated. |
+| `POST` | `/api/rooms/:code/start` | Host force-starts the game (validates `host_token`), readying all players and returning round-1 images. |
 | `GET` | `/api/health` | Returns backend health status `{status: "ok", active_rooms, pool_size}`. |
 
 ### WebSocket Endpoint (`GET /api/ws?room_code=...&player_id=...`)

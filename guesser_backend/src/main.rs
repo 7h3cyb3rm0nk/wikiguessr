@@ -10,11 +10,14 @@ mod rooms;
 mod rules;
 mod scoring;
 
-use api::http::{create_room, get_room_info, health_check, join_room, solo_guess, solo_start};
+use api::http::{
+    create_room, get_room_info, health_check, join_room, solo_guess, solo_round_result,
+    solo_round_state, solo_start, start_room,
+};
 use api::websocket::ws_handler;
 use app_state::AppState;
-use axum::routing::{get, post};
 use axum::Router;
+use axum::routing::{get, post};
 use config::Config;
 use std::net::SocketAddr;
 use tower_http::cors::CorsLayer;
@@ -51,10 +54,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Single-player REST routes
         .route("/api/solo/start", post(solo_start))
         .route("/api/solo/guess", post(solo_guess))
+        .route("/api/solo/round", get(solo_round_state))
+        .route("/api/solo/round/result", get(solo_round_result))
         // Multiplayer REST routes
         .route("/api/rooms", post(create_room))
         .route("/api/rooms/{code}", get(get_room_info))
         .route("/api/rooms/{code}/join", post(join_room))
+        .route("/api/rooms/{code}/start", post(start_room))
         // WebSocket multiplayer route
         .route("/api/ws", get(ws_handler))
         // Health check

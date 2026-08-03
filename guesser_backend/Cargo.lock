@@ -485,6 +485,7 @@ dependencies = [
  "dashmap",
  "futures-util",
  "http-body-util",
+ "percent-encoding",
  "rand 0.10.2",
  "reqwest",
  "serde",
