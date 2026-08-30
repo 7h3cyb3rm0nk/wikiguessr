@@ -1,5 +1,5 @@
 use crate::config::GameConfig;
-use crate::image::Image;
+use crate::image::{self, Image};
 use crate::location::coordinates::{Coordinate, ItemId, Location};
 use crate::resources::cache::ImageCache;
 use crate::resources::commons::CommonsClient;
@@ -137,6 +137,10 @@ impl ResourceManager {
                             let mut added = 0;
                             for loc in batch {
                                 let images = self.images_for(&loc.item_id, loc.coordinate).await;
+                                if images.is_empty() {
+                                    warn!(item_id = %loc.item_id.0, "skipping location with no usable images");
+                                    continue;
+                                }
                                 self.pool.push_batch(vec![PreparedRound { location: loc, images }]);
                                 info!(added, new_total = self.pool.len(), "added location to pool");
 
